@@ -23,14 +23,18 @@ jobs:
           FILE=""
           for f in *.lua; do
             [ -f "$f" ] || continue
-            if head -c 2 "$f" | grep -q "LJ"; then
+            MAGIC=$(head -c 3 "$f" | od -An -tx1 | tr -d ' \n')
+            echo "  $f  first 3 bytes = $MAGIC"
+            if [ "$MAGIC" = "1b4c4a" ]; then
               FILE="$f"
-              echo "Found LuaJIT bytecode: $f"
+              echo "  -> LuaJIT bytecode detected"
               break
             fi
           done
           if [ -z "$FILE" ]; then
-            echo "::error::No LuaJIT bytecode file (.lua with LJ header) found in repo root"
+            echo "::error::No LuaJIT bytecode file (magic 1b 4c 4a) found in repo root"
+            echo "Files present in repo root:"
+            ls -la
             exit 1
           fi
           echo "file=$FILE" >> $GITHUB_OUTPUT
@@ -53,7 +57,7 @@ jobs:
           timeout 300 python3 main.py -f "../${{ steps.detect.outputs.file }}" -o "../decompiled.lua" > "../ljd_normal.log" 2>&1 || true
           cd ..
           echo "--- LJD normal log (tail) ---"
-          tail -n 15 ljd_normal.log || true
+          tail -n 20 ljd_normal.log || true
           if [ -s decompiled.lua ]; then
             echo "result=success" >> $GITHUB_OUTPUT
             echo "✅ LJD normal succeeded!"
@@ -72,7 +76,7 @@ jobs:
           timeout 300 python3 main.py -f "../${{ steps.detect.outputs.file }}" -o "../decompiled.lua" --catch_asserts > "../ljd_catch.log" 2>&1 || true
           cd ..
           echo "--- LJD catch_asserts log (tail) ---"
-          tail -n 15 ljd_catch.log || true
+          tail -n 20 ljd_catch.log || true
           if [ -s decompiled.lua ]; then
             echo "result=success" >> $GITHUB_OUTPUT
             echo "✅ LJD with --catch_asserts succeeded!"
@@ -102,7 +106,7 @@ jobs:
           fi
           cd ..
           echo "--- v2 build log (tail) ---"
-          tail -n 20 v2_build.log || true
+          tail -n 25 v2_build.log || true
           if [ -s decompiled.lua ]; then
             echo "result=success" >> $GITHUB_OUTPUT
             echo "✅ LuaJIT Decompiler v2 succeeded!"
@@ -127,14 +131,11 @@ jobs:
             echo "===== First 120 lines ====="
             head -n 120 decompiled.lua
           else
-            echo "❌ All decompilation attempts failed."
-            echo ""
-            echo "This is expected for heavily stripped LuaJIT 2.1 bytecode."
-            echo "See the logs below for details:"
+            echo "❌ No output was produced."
             for log in ljd_normal.log ljd_catch.log v2_build.log; do
               if [ -f "$log" ]; then
-                echo "--- $log ---"
-                tail -n 25 "$log"
+                echo "--- $log (tail) ---"
+                tail -n 30 "$log"
               fi
             done
           fi
