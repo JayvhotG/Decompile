@@ -1,0 +1,162 @@
+name: Decompile LuaJIT Bytecode
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  decompile:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Detect LuaJIT bytecode file
+        id: detect
+        run: |
+          echo "Looking for LuaJIT bytecode files..."
+          FILE=""
+          for f in *.lua; do
+            [ -f "$f" ] || continue
+            if head -c 2 "$f" | grep -q "LJ"; then
+              FILE="$f"
+              echo "Found LuaJIT bytecode: $f"
+              break
+            fi
+          done
+          if [ -z "$FILE" ]; then
+            echo "::error::No LuaJIT bytecode file (.lua with LJ header) found in repo root"
+            exit 1
+          fi
+          echo "file=$FILE" >> $GITHUB_OUTPUT
+          echo "basename=$(basename "$FILE" .lua)" >> $GITHUB_OUTPUT
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Clone LJD decompiler
+        run: |
+          git clone --depth 1 https://github.com/Dr-MTN/luajit-decompiler.git ljd
+
+      - name: Attempt 1 - LJD (normal)
+        id: ljd1
+        continue-on-error: true
+        run: |
+          cd ljd
+          timeout 300 python3 main.py -f "../${{ steps.detect.outputs.file }}" -o "../decompiled.lua" > "../ljd_normal.log" 2>&1 || true
+          cd ..
+          echo "--- LJD normal log (tail) ---"
+          tail -n 15 ljd_normal.log || true
+          if [ -s decompiled.lua ]; then
+            echo "result=success" >> $GITHUB_OUTPUT
+            echo "✅ LJD normal succeeded!"
+          else
+            echo "result=failed" >> $GITHUB_OUTPUT
+            echo "❌ LJD normal produced no output."
+          fi
+
+      - name: Attempt 2 - LJD (--catch_asserts)
+        if: steps.ljd1.outputs.result != 'success'
+        id: ljd2
+        continue-on-error: true
+        run: |
+          rm -f decompiled.lua
+          cd ljd
+          timeout 300 python3 main.py -f "../${{ steps.detect.outputs.file }}" -o "../decompiled.lua" --catch_asserts > "../ljd_catch.log" 2>&1 || true
+          cd ..
+          echo "--- LJD catch_asserts log (tail) ---"
+          tail -n 15 ljd_catch.log || true
+          if [ -s decompiled.lua ]; then
+            echo "result=success" >> $GITHUB_OUTPUT
+            echo "✅ LJD with --catch_asserts succeeded!"
+          else
+            echo "result=failed" >> $GITHUB_OUTPUT
+            echo "❌ LJD with --catch_asserts produced no output."
+          fi
+
+      - name: Attempt 3 - LuaJIT Decompiler v2 (build from source)
+        if: steps.ljd1.outputs.result != 'success' && steps.ljd2.outputs.result != 'success'
+        id: v2
+        continue-on-error: true
+        run: |
+          rm -f decompiled.lua
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake g++ make lua5.1 liblua5.1-0-dev > /dev/null 2>&1 || true
+          git clone --depth 1 https://github.com/marsinator358/luajit-decompiler-v2.git v2src
+          cd v2src
+          if [ -d "src" ] && [ -f "CMakeLists.txt" ]; then
+            cmake -S . -B build > "../v2_build.log" 2>&1 || true
+            cmake --build build -j2 >> "../v2_build.log" 2>&1 || true
+            BIN=$(find build -type f -executable -name "*decompil*" 2>/dev/null | head -n 1)
+            if [ -n "$BIN" ] && [ -x "$BIN" ]; then
+              echo "Found binary: $BIN"
+              "$BIN" "../${{ steps.detect.outputs.file }}" > "../decompiled.lua" 2>> "../v2_build.log" || true
+            fi
+          fi
+          cd ..
+          echo "--- v2 build log (tail) ---"
+          tail -n 20 v2_build.log || true
+          if [ -s decompiled.lua ]; then
+            echo "result=success" >> $GITHUB_OUTPUT
+            echo "✅ LuaJIT Decompiler v2 succeeded!"
+          else
+            echo "result=failed" >> $GITHUB_OUTPUT
+            echo "❌ LuaJIT Decompiler v2 produced no output."
+          fi
+
+      - name: Show final result
+        if: always()
+        run: |
+          echo "=============================="
+          echo "          RESULTS"
+          echo "=============================="
+          ls -la
+          echo ""
+          if [ -s decompiled.lua ]; then
+            echo "✅ Decompiled successfully!"
+            echo "File size: $(wc -c < decompiled.lua) bytes"
+            echo "Lines: $(wc -l < decompiled.lua)"
+            echo ""
+            echo "===== First 120 lines ====="
+            head -n 120 decompiled.lua
+          else
+            echo "❌ All decompilation attempts failed."
+            echo ""
+            echo "This is expected for heavily stripped LuaJIT 2.1 bytecode."
+            echo "See the logs below for details:"
+            for log in ljd_normal.log ljd_catch.log v2_build.log; do
+              if [ -f "$log" ]; then
+                echo "--- $log ---"
+                tail -n 25 "$log"
+              fi
+            done
+          fi
+
+      - name: Commit decompiled result to repo
+        if: hashFiles('decompiled.lua') != ''
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add decompiled.lua
+          git commit -m "Add decompiled source for ${{ steps.detect.outputs.file }}" || echo "Nothing to commit"
+          git push || echo "Nothing to push"
+
+      - name: Upload artifact (backup download)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: decompilation-result
+          path: |
+            decompiled.lua
+            ljd_normal.log
+            ljd_catch.log
+            v2_build.log
+          if-no-files-found: warn
+          retention-days: 30
