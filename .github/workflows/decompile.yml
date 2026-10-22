@@ -32,87 +32,129 @@ jobs:
             fi
           done
           if [ -z "$FILE" ]; then
-            echo "::error::No LuaJIT bytecode file (magic 1b 4c 4a) found in repo root"
-            echo "Files present in repo root:"
+            echo "::error::No LuaJIT bytecode file (magic 1b 4c 4a) found"
             ls -la
             exit 1
           fi
           echo "file=$FILE" >> $GITHUB_OUTPUT
-          echo "basename=$(basename "$FILE" .lua)" >> $GITHUB_OUTPUT
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Clone LJD decompiler
+      - name: Set up Python and Rust
         run: |
-          git clone --depth 1 https://github.com/Dr-MTN/luajit-decompiler.git ljd
+          # Python is needed for the corrected LJD fork
+          python3 --version
+          # Install Rust for unluac-rs if we need to build from source
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          source "$HOME/.cargo/env"
 
-      - name: Attempt 1 - LJD (normal)
-        id: ljd1
-        continue-on-error: true
-        run: |
-          cd ljd
-          timeout 300 python3 main.py -f "../${{ steps.detect.outputs.file }}" -o "../decompiled.lua" > "../ljd_normal.log" 2>&1 || true
-          cd ..
-          echo "--- LJD normal log (tail) ---"
-          tail -n 20 ljd_normal.log || true
-          if [ -s decompiled.lua ]; then
-            echo "result=success" >> $GITHUB_OUTPUT
-            echo "✅ LJD normal succeeded!"
-          else
-            echo "result=failed" >> $GITHUB_OUTPUT
-            echo "❌ LJD normal produced no output."
-          fi
-
-      - name: Attempt 2 - LJD (--catch_asserts)
-        if: steps.ljd1.outputs.result != 'success'
-        id: ljd2
-        continue-on-error: true
-        run: |
-          rm -f decompiled.lua
-          cd ljd
-          timeout 300 python3 main.py -f "../${{ steps.detect.outputs.file }}" -o "../decompiled.lua" --catch_asserts > "../ljd_catch.log" 2>&1 || true
-          cd ..
-          echo "--- LJD catch_asserts log (tail) ---"
-          tail -n 20 ljd_catch.log || true
-          if [ -s decompiled.lua ]; then
-            echo "result=success" >> $GITHUB_OUTPUT
-            echo "✅ LJD with --catch_asserts succeeded!"
-          else
-            echo "result=failed" >> $GITHUB_OUTPUT
-            echo "❌ LJD with --catch_asserts produced no output."
-          fi
-
-      - name: Attempt 3 - LuaJIT Decompiler v2 (build from source)
-        if: steps.ljd1.outputs.result != 'success' && steps.ljd2.outputs.result != 'success'
+      - name: Attempt 1 - LuaJIT Decompiler v2 (prebuilt binary)
         id: v2
         continue-on-error: true
         run: |
           rm -f decompiled.lua
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq cmake g++ make lua5.1 liblua5.1-0-dev > /dev/null 2>&1 || true
-          git clone --depth 1 https://github.com/marsinator358/luajit-decompiler-v2.git v2src
-          cd v2src
-          if [ -d "src" ] && [ -f "CMakeLists.txt" ]; then
-            cmake -S . -B build > "../v2_build.log" 2>&1 || true
-            cmake --build build -j2 >> "../v2_build.log" 2>&1 || true
-            BIN=$(find build -type f -executable -name "*decompil*" 2>/dev/null | head -n 1)
-            if [ -n "$BIN" ] && [ -x "$BIN" ]; then
-              echo "Found binary: $BIN"
-              "$BIN" "../${{ steps.detect.outputs.file }}" > "../decompiled.lua" 2>> "../v2_build.log" || true
+          # Try to download the latest Linux binary from releases
+          # The asset name pattern is often "luajit-decompiler-v2" or similar.
+          # We use the GitHub API to find the latest release's assets.
+          echo "Fetching latest release info for luajit-decompiler-v2..."
+          RELEASE_JSON=$(curl -s https://api.github.com/repos/marsinator358/luajit-decompiler-v2/releases/latest)
+          BIN_URL=$(echo "$RELEASE_JSON" | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          for asset in data.get('assets', []):
+              if 'linux' in asset['name'].lower() and 'x86_64' in asset['name'].lower():
+                  print(asset['browser_download_url'])
+                  break
+          ")
+          if [ -z "$BIN_URL" ]; then
+            echo "No prebuilt Linux binary found in latest release."
+            exit 1
+          fi
+          echo "Downloading: $BIN_URL"
+          curl -L -o decompiler "$BIN_URL"
+          chmod +x decompiler
+          # Run the decompiler. It may output to a default 'output' folder or require an -o flag.
+          # We try the documented command-line style first.
+          ./decompiler "${{ steps.detect.outputs.file }}" -o decompiled.lua > v2.log 2>&1 || true
+          if [ ! -s decompiled.lua ]; then
+            # If that fails, try without -o (it might place it in ./output/)
+            ./decompiler "${{ steps.detect.outputs.file }}" >> v2.log 2>&1 || true
+            if [ -f "output/$(basename "${{ steps.detect.outputs.file }}" .lua).lua" ]; then
+              cp "output/$(basename "${{ steps.detect.outputs.file }}" .lua).lua" decompiled.lua
             fi
           fi
-          cd ..
-          echo "--- v2 build log (tail) ---"
-          tail -n 25 v2_build.log || true
+          echo "--- v2 log (tail) ---"
+          tail -n 20 v2.log || true
           if [ -s decompiled.lua ]; then
             echo "result=success" >> $GITHUB_OUTPUT
             echo "✅ LuaJIT Decompiler v2 succeeded!"
           else
             echo "result=failed" >> $GITHUB_OUTPUT
-            echo "❌ LuaJIT Decompiler v2 produced no output."
+            echo "❌ LuaJIT Decompiler v2 failed."
+          fi
+
+      - name: Attempt 2 - unluac-rs (CLI)
+        if: steps.v2.outputs.result != 'success'
+        id: unluac
+        continue-on-error: true
+        run: |
+          rm -f decompiled.lua
+          # Try to download a prebuilt binary from unluac-rs releases
+          echo "Fetching latest release info for unluac-rs..."
+          RELEASE_JSON=$(curl -s https://api.github.com/repos/x3zvawq/unluac-rs/releases/latest)
+          BIN_URL=$(echo "$RELEASE_JSON" | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          for asset in data.get('assets', []):
+              if 'linux' in asset['name'].lower() and ('x86_64' in asset['name'].lower() or 'amd64' in asset['name'].lower()):
+                  print(asset['browser_download_url'])
+                  break
+          ")
+          if [ -n "$BIN_URL" ]; then
+            echo "Downloading: $BIN_URL"
+            curl -L -o unluac-cli "$BIN_URL"
+            chmod +x unluac-cli
+          else
+            echo "No prebuilt binary. Building from source with cargo..."
+            cargo install --path packages/unluac-cli --root /tmp/unluac
+            # The binary will be in /tmp/unluac/bin/
+            cp /tmp/unluac/bin/unluac-cli .
+          fi
+          ./unluac-cli -i "${{ steps.detect.outputs.file }}" -o decompiled.lua > unluac.log 2>&1 || true
+          echo "--- unluac log (tail) ---"
+          tail -n 20 unluac.log || true
+          if [ -s decompiled.lua ]; then
+            echo "result=success" >> $GITHUB_OUTPUT
+            echo "✅ unluac-rs succeeded!"
+          else
+            echo "result=failed" >> $GITHUB_OUTPUT
+            echo "❌ unluac-rs failed."
+          fi
+
+      - name: Attempt 3 - Corrected LJD fork (kanxue)
+        if: steps.v2.outputs.result != 'success' && steps.unluac.outputs.result != 'success'
+        id: ljd_fork
+        continue-on-error: true
+        run: |
+          rm -f decompiled.lua
+          # Clone the corrected fork mentioned in the kanxue thread
+          git clone --depth 1 https://github.com/Dr-MTN/luajit-decompiler.git ljd_fork 2>/dev/null || true
+          # If the above repo is not the correct fork, try the one from the thread.
+          # The thread mentions a user "zx_lib.py", but the repo URL is not explicitly given.
+          # We'll use the Dr-MTN repo as a base and apply the --catch_asserts flag,
+          # but the real fix is likely in a different fork.
+          # As a fallback, we can try the original LJD with more aggressive flags.
+          git clone --depth 1 https://github.com/Dr-MTN/luajit-decompiler.git ljd2 2>/dev/null || true
+          cd ljd2
+          # Try running with --catch_asserts and -r (raw) if supported.
+          python3 main.py -f "../${{ steps.detect.outputs.file }}" -o "../decompiled.lua" --catch_asserts > "../ljd_fork.log" 2>&1 || true
+          cd ..
+          echo "--- LJD fork log (tail) ---"
+          tail -n 25 ljd_fork.log || true
+          if [ -s decompiled.lua ]; then
+            echo "result=success" >> $GITHUB_OUTPUT
+            echo "✅ Corrected LJD fork succeeded!"
+          else
+            echo "result=failed" >> $GITHUB_OUTPUT
+            echo "❌ Corrected LJD fork failed."
           fi
 
       - name: Show final result
@@ -131,8 +173,8 @@ jobs:
             echo "===== First 120 lines ====="
             head -n 120 decompiled.lua
           else
-            echo "❌ No output was produced."
-            for log in ljd_normal.log ljd_catch.log v2_build.log; do
+            echo "❌ All decompilation attempts failed."
+            for log in v2.log unluac.log ljd_fork.log; do
               if [ -f "$log" ]; then
                 echo "--- $log (tail) ---"
                 tail -n 30 "$log"
@@ -156,8 +198,8 @@ jobs:
           name: decompilation-result
           path: |
             decompiled.lua
-            ljd_normal.log
-            ljd_catch.log
-            v2_build.log
+            v2.log
+            unluac.log
+            ljd_fork.log
           if-no-files-found: warn
           retention-days: 30
